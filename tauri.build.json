@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm --prefix horeca-pos-web run build",
+    "frontendDist": "../horeca-pos-web/out"
+  }
+}

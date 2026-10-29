@@ -1,0 +1,123 @@
+# Builds the Windows installer from git and publishes it as a GitHub Release.
+# Installed apps find the new version through the release's latest.json and update themselves.
+#
+# Start a release in either of two ways:
+#   1. Push a tag:        git tag v1.0.2 && git push origin v1.0.2
+#   2. GitHub website:    Actions > "Release desktop app" > Run workflow > enter the version
+#
+# The web app inside the installer is built from the horeca-pos-web repository (the same code Vercel hosts).
+name: Release desktop app
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, like 1.0.2'
+        required: true
+      web_ref:
+        description: 'Web app branch, tag or commit to build into the installer'
+        required: false
+        default: 'main'
+      notes:
+        description: 'What changed (shown to users)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      WEB_REPO: osamamalikawan/horeca-pos-web
+    steps:
+      - name: Work out the version
+        id: v
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then RAW="$INPUT_VERSION"; else RAW="$GITHUB_REF_NAME"; fi
+          VERSION="${RAW#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::\"$RAW\" is not a version like 1.0.2 (a tag must look like v1.0.2)"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $VERSION"
+
+      # The two projects sit side by side, so "../horeca-pos-web/out" in tauri.conf.json works here exactly as on your computer.
+      - uses: actions/checkout@v4
+        with:
+          path: horeca-pos-windows
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WEB_REPO }}
+          ref: ${{ inputs.web_ref || 'main' }}
+          token: ${{ secrets.WEB_REPO_TOKEN || github.token }}   # needed only while the web repository is private
+          path: horeca-pos-web
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: horeca-pos-web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: horeca-pos-windows
+
+      - name: Build the web app
+        working-directory: horeca-pos-web
+        shell: bash
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          npm ci
+          npm run build
+          test -f out/index.html
+
+      - name: Set the version
+        working-directory: horeca-pos-windows
+        shell: bash
+        run: node scripts/set-version.mjs "${{ steps.v.outputs.version }}"
+
+      - name: Build and sign the installer
+        working-directory: horeca-pos-windows
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx --yes @tauri-apps/cli@latest build
+
+      - name: Prepare the update files
+        working-directory: horeca-pos-windows
+        shell: bash
+        env:
+          RELEASE_REPO: ${{ github.repository }}
+          NOTES: ${{ inputs.notes }}
+        run: node scripts/make-latest-json.mjs "${NOTES:-Version ${{ steps.v.outputs.version }}}"
+
+      - name: Publish the release
+        working-directory: horeca-pos-windows
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          TAG="v${{ steps.v.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --title "$TAG" --notes "${NOTES:-Version ${{ steps.v.outputs.version }}}"
+          fi
+          echo "Published $TAG"

@@ -1,0 +1,516 @@
+diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
+--- a/.github/workflows/release.yml	1970-01-01 00:00:00.000000000 +0000
++++ b/.github/workflows/release.yml	2026-10-28 20:34:49.000000000 +0000
+@@ -0,0 +1,93 @@
++# Builds the Windows installer from git and publishes it as a GitHub Release.
++# Installed apps find the new version through the release's latest.json and update themselves.
++#
++# Start a release in either of two ways:
++#   1. Push a tag:        git tag v1.0.2 && git push origin v1.0.2
++#   2. GitHub website:    Actions > "Release desktop app" > Run workflow > enter the version
++#
++# The web app inside the installer is fetched from git (the horeca-pos-web repository, the same code Vercel hosts).
++name: Release desktop app
++
++on:
++  push:
++    tags: ['v*']
++  workflow_dispatch:
++    inputs:
++      version:
++        description: 'Version to release, like 1.0.2'
++        required: true
++      web_ref:
++        description: 'Web app branch, tag or commit to build into the installer'
++        required: false
++        default: 'main'
++      notes:
++        description: 'What changed (shown to users)'
++        required: false
++        default: ''
++
++permissions:
++  contents: write
++
++concurrency:
++  group: release
++  cancel-in-progress: false
++
++jobs:
++  release:
++    runs-on: windows-latest
++    timeout-minutes: 60
++    steps:
++      - name: Work out the version
++        id: v
++        shell: bash
++        env:
++          EVENT: ${{ github.event_name }}
++          INPUT_VERSION: ${{ inputs.version }}
++        run: |
++          if [ "$EVENT" = "workflow_dispatch" ]; then RAW="$INPUT_VERSION"; else RAW="$GITHUB_REF_NAME"; fi
++          VERSION="${RAW#v}"
++          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
++            echo "::error::\"$RAW\" is not a version like 1.0.2 (a tag must look like v1.0.2)"; exit 1
++          fi
++          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
++          echo "Releasing version $VERSION"
++
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 20
++      - uses: dtolnay/rust-toolchain@stable
++      - uses: swatinem/rust-cache@v2
++
++      - name: Set the version
++        shell: bash
++        run: node scripts/set-version.mjs "${{ steps.v.outputs.version }}"
++
++      # Gets the web app from git (horeca-pos-web), builds it, builds and signs the installer, prepares latest.json.
++      - name: Build the installer
++        shell: bash
++        env:
++          WEB_REF: ${{ inputs.web_ref || 'main' }}
++          WEB_REPO_TOKEN: ${{ secrets.WEB_REPO_TOKEN }}                 # needed only while the web repository is private
++          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
++          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
++          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
++          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
++          RELEASE_REPO: ${{ github.repository }}
++          NOTES: ${{ inputs.notes }}
++        run: node scripts/build-installer.mjs "${NOTES:-Version ${{ steps.v.outputs.version }}}"
++
++      - name: Publish the release
++        shell: bash
++        env:
++          GH_TOKEN: ${{ github.token }}
++          NOTES: ${{ inputs.notes }}
++        run: |
++          TAG="v${{ steps.v.outputs.version }}"
++          if gh release view "$TAG" >/dev/null 2>&1; then
++            gh release upload "$TAG" release/* --clobber
++          else
++            gh release create "$TAG" release/* --title "$TAG" --notes "${NOTES:-Version ${{ steps.v.outputs.version }}}"
++          fi
++          echo "Published $TAG"
+diff -ruN a/.gitignore b/.gitignore
+--- a/.gitignore	2026-10-21 12:43:54.000000000 +0000
++++ b/.gitignore	2026-10-28 20:34:40.000000000 +0000
+@@ -2,3 +2,6 @@
+ # will have compiled files and executables
+ /target/
+ /gen/schemas
++.web-src/
++.env.web
++/release/
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-10-28 06:39:59.000000000 +0000
++++ b/Cargo.toml	2026-10-26 05:54:07.000000000 +0000
+@@ -28,4 +28,4 @@
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ webview2-com = "0.39.1"
+-windows = "0.62.2"
++windows = { version = "0.62.2", features = ["Win32_Graphics_Printing"] }
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-10-28 06:39:59.000000000 +0000
++++ b/README.md	2026-10-28 20:36:23.000000000 +0000
+@@ -1,28 +1,62 @@
+ # Horeca POS - Windows shell (Tauri)
+ 
+-Wraps the web app (`../horeca-pos-web`, built to `../horeca-pos-web/out`) in a Windows program that works offline
++A Windows program that wraps the Horeca POS web app. It works offline, prints straight to your printers,
+ and updates itself.
+ 
+-Folder layout expected:
++Where things come from (nothing depends on a folder on your computer):
++- The web app is fetched **from git** (the `horeca-pos-web` repository) every time an installer is built.
++  It is the same code Vercel hosts for the browser version.
++- The installer is published as a **GitHub Release** of this repository. Installed apps read the release's
++  `latest.json` and update themselves.
++
++## One-time setup
++1. Make the update signing key:
++   `npx @tauri-apps/cli@latest signer generate -w C:\dev\keys\horeca-updater.key`
++   Choose a password. Keep the key file and password safe and NEVER commit them. If they are lost, installed apps
++   cannot be updated.
++2. Put the public key into `tauri.conf.json`: `node scripts/setup-updater-key.mjs C:\dev\keys\horeca-updater.key.pub`
++   and commit `tauri.conf.json`.
++3. In this repository on GitHub: Settings > Secrets and variables > Actions > New repository secret:
++
++| Secret | Value |
++|---|---|
++| `TAURI_SIGNING_PRIVATE_KEY` | the full text of `horeca-updater.key` |
++| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | the key's password |
++| `NEXT_PUBLIC_SUPABASE_URL` | your Supabase project URL |
++| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | your Supabase publishable key (never the secret key) |
++| `WEB_REPO_TOKEN` | only while `horeca-pos-web` is private: a fine-grained token with read access to its contents |
++
++## Releasing a version (GitHub builds it)
++Push the web app changes to `horeca-pos-web` first: the installer contains whatever is on the branch you build.
++Then either
++- push a tag: `git tag v1.0.2 && git push origin v1.0.2`, or
++- GitHub website: Actions > "Release desktop app" > Run workflow > enter the version (optionally a web branch/tag/commit and notes).
++
++The workflow fetches and builds the web app from git, builds and signs the installer, and publishes
++`Horeca-Store-POS_<version>_x64-setup.exe` and `latest.json`. The version comes from the tag.
++This repository's releases must be publicly downloadable, because installed apps read
++`https://github.com/osamamalikawan/horeca-pos-windows/releases/latest/download/latest.json`.
++
++## Building on your own computer (only if you ever need to)
++Needs Node, Rust 1.90 or newer and the Visual Studio C++ Build Tools.
++Put your two Supabase values in a file named `.env.web` in this folder (it is git-ignored):
+ ```
+-C:\dev\horeca-pos-web        (the Next.js app)
+-C:\dev\horeca-pos-windows    (this project)
++NEXT_PUBLIC_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
++NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+ ```
++Then, in PowerShell:
++```
++$env:TAURI_SIGNING_PRIVATE_KEY = "C:\dev\keys\horeca-updater.key"
++$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "your password"
++node scripts/set-version.mjs 1.0.2
++node scripts/build-installer.mjs "What changed"
++```
++The installer and `latest.json` appear in `release\`. To build a different web version:
++`$env:WEB_REF = "some-branch"` (add `$env:WEB_REPO_TOKEN` while the web repository is private).
+ 
+-## One-time setup: signing key for updates
+-1. `npx @tauri-apps/cli@latest signer generate -w C:\dev\keys\horeca-updater.key`
+-   Choose a password. This creates the private key and `horeca-updater.key.pub`.
+-   Keep the private key and its password safe and NEVER commit them. Lose them and installed apps cannot be updated.
+-2. `node scripts/setup-updater-key.mjs C:\dev\keys\horeca-updater.key.pub`
+-3. Install Rust 1.90 or newer and the Visual Studio C++ Build Tools.
+-
+-## Releasing a version
+-1. Raise `"version"` in `tauri.conf.json` (e.g. 1.0.2).
+-2. `.\release.ps1 -Notes "What changed"` (builds web app, builds and signs the installer, prepares `release\`).
+-3. Publish: `gh release create v1.0.2 release\* --title "v1.0.2" --notes "What changed"`
+-   (or upload the two files in `release\` on the GitHub Releases page, with the tag `v1.0.2`).
+-
+-Installed apps check `https://github.com/osamamalikawan/horeca-pos-windows/releases/latest/download/latest.json`,
+-so this repository's releases must be publicly downloadable.
++## Printing
++In the desktop app, printing goes straight to the printer chosen in Settings (no dialog). Receipts use the receipt
++printer, labels the sticker printer, statements the Windows default printer. If a direct print fails, the normal
++print dialog opens.
+ 
+ The app identifier (`com.osamamalik.horecastorepos`) decides where local data is stored. Never change it.
+diff -ruN a/release.ps1 b/release.ps1
+--- a/release.ps1	2026-10-28 06:39:59.000000000 +0000
++++ b/release.ps1	1970-01-01 00:00:00.000000000 +0000
+@@ -1,24 +0,0 @@
+-# Builds the web app and the Windows installer, signs it, and prepares the update files.
+-# Run from C:\dev\horeca-pos-windows after raising "version" in tauri.conf.json:
+-#   .\release.ps1 -Notes "What changed"
+-param(
+-  [string]$Notes = "Update",
+-  [string]$WebDir = "..\horeca-pos-web",
+-  [string]$KeyFile = "C:\dev\keys\horeca-updater.key"
+-)
+-$ErrorActionPreference = 'Stop'
+-if (-not (Test-Path $KeyFile)) { throw "Signing key not found: $KeyFile (see README, step 1)" }
+-
+-Write-Host "1/3 Building the web app..."
+-Push-Location $WebDir; npm install; if ($LASTEXITCODE) { throw "npm install failed" }
+-npm run build; if ($LASTEXITCODE) { throw "web build failed" }; Pop-Location
+-
+-Write-Host "2/3 Building and signing the installer (the first build is slow)..."
+-$env:TAURI_SIGNING_PRIVATE_KEY = $KeyFile
+-if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+-  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = Read-Host "Signing key password (empty if none)"
+-}
+-npx @tauri-apps/cli@latest build; if ($LASTEXITCODE) { throw "installer build failed" }
+-
+-Write-Host "3/3 Preparing the update files..."
+-node scripts/make-latest-json.mjs $Notes; if ($LASTEXITCODE) { throw "could not prepare release files" }
+diff -ruN a/scripts/build-installer.mjs b/scripts/build-installer.mjs
+--- a/scripts/build-installer.mjs	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/build-installer.mjs	2026-10-28 20:34:40.000000000 +0000
+@@ -0,0 +1,16 @@
++// One command for a full build: web app from git -> signed Windows installer -> files to publish.
++// Used by the GitHub release workflow, and by you if you ever need to build on your own computer.
++//   node scripts/build-installer.mjs "What changed in this version"
++// Needs TAURI_SIGNING_PRIVATE_KEY (the key text, or the path to the key file) and TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
++import { execFileSync, execSync } from 'node:child_process';
++
++if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
++  console.error('TAURI_SIGNING_PRIVATE_KEY is not set (the updater key, or the path to its file).');
++  process.exit(1);
++}
++process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
++const notes = process.argv[2] || '';
++
++execFileSync('node', ['scripts/fetch-web.mjs'], { stdio: 'inherit' });
++execSync('npx --yes @tauri-apps/cli@latest build', { stdio: 'inherit' });
++execFileSync('node', ['scripts/make-latest-json.mjs', notes], { stdio: 'inherit' });
+diff -ruN a/scripts/fetch-web.mjs b/scripts/fetch-web.mjs
+--- a/scripts/fetch-web.mjs	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/fetch-web.mjs	2026-10-28 20:34:40.000000000 +0000
+@@ -0,0 +1,49 @@
++// Gets the web app from GIT, builds it, and leaves the finished files in .web-src/out,
++// which is what the installer packs (tauri.conf.json: "frontendDist": "./.web-src/out").
++// Nothing depends on a folder you keep on your computer.
++//
++//   WEB_REPO_URL   where the web app lives            (default: the horeca-pos-web repository on GitHub)
++//   WEB_REF        branch, tag or commit to build     (default: main)
++//   WEB_REPO_TOKEN only while the web repository is private: a GitHub token that can read it
++//   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY   baked into the web app
++//     (or put them as KEY=VALUE lines in a file named .env.web next to this project; it is git-ignored)
++import { execFileSync, execSync } from 'node:child_process';
++import fs from 'node:fs';
++
++const REPO = process.env.WEB_REPO_URL || 'https://github.com/osamamalikawan/horeca-pos-web.git';
++const REF = process.env.WEB_REF || 'main';
++const DIR = '.web-src';
++
++if (fs.existsSync('.env.web')) {
++  for (const line of fs.readFileSync('.env.web', 'utf8').split(/\r?\n/)) {
++    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
++    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
++  }
++}
++for (const key of ['NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY']) {
++  if (!process.env[key]) { console.error(`Missing ${key}. Set it, or put it in a .env.web file (see README).`); process.exit(1); }
++}
++
++// the token goes in through git's environment, so it never lands in a file or on a command line
++const gitEnv = { ...process.env };
++if (process.env.WEB_REPO_TOKEN) {
++  const basic = Buffer.from(`x-access-token:${process.env.WEB_REPO_TOKEN}`).toString('base64');
++  Object.assign(gitEnv, {
++    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
++  });
++}
++const git = (...args) => execFileSync('git', args, { cwd: DIR, stdio: 'inherit', env: gitEnv });
++
++console.log(`Getting the web app from ${REPO} (${REF})`);
++fs.rmSync(DIR, { recursive: true, force: true });
++fs.mkdirSync(DIR, { recursive: true });
++git('init', '-q');
++git('remote', 'add', 'origin', REPO);
++git('fetch', '-q', '--depth', '1', 'origin', REF);      // works for a branch, a tag or a commit
++git('checkout', '-q', 'FETCH_HEAD');
++console.log('Web app commit: ' + execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: DIR, env: gitEnv }).toString().trim());
++
++execSync('npm ci', { cwd: DIR, stdio: 'inherit' });
++execSync('npm run build', { cwd: DIR, stdio: 'inherit' });
++if (!fs.existsSync(`${DIR}/out/index.html`)) { console.error('The web build did not produce out/index.html'); process.exit(1); }
++console.log(`Web app ready in ${DIR}/out`);
+diff -ruN a/scripts/set-version.mjs b/scripts/set-version.mjs
+--- a/scripts/set-version.mjs	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/set-version.mjs	2026-10-27 11:04:00.000000000 +0000
+@@ -0,0 +1,10 @@
++// Sets the app version in tauri.conf.json (used by the release workflow: the git tag decides the version).
++// Usage: node scripts/set-version.mjs 1.0.2
++import fs from 'node:fs';
++
++const version = (process.argv[2] || '').replace(/^v/, '');
++if (!/^\d+\.\d+\.\d+$/.test(version)) { console.error(`"${process.argv[2] ?? ''}" is not a version like 1.0.2`); process.exit(1); }
++const conf = JSON.parse(fs.readFileSync('tauri.conf.json', 'utf8'));
++conf.version = version;
++fs.writeFileSync('tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
++console.log(`Version set to ${version}`);
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-10-28 06:39:59.000000000 +0000
++++ b/src/lib.rs	2026-10-26 05:54:07.000000000 +0000
+@@ -1,3 +1,6 @@
++mod printing;
++
++use printing::PrinterInfo;
+ use tauri::WebviewWindow;
+ 
+ #[cfg(target_os = "windows")]
+@@ -12,11 +15,23 @@
+ #[cfg(target_os = "windows")]
+ use windows::core::Interface;
+ 
++/// Installed printers, for the printer drop-down in Settings.
++#[tauri::command]
++async fn list_printers() -> Result<Vec<PrinterInfo>, String> {
++    tauri::async_runtime::spawn_blocking(printing::list_installed_printers)
++        .await
++        .map_err(|error| error.to_string())?
++}
++
++/// Prints the current page straight to a printer, without a dialog.
++/// An empty or missing `printer_name` means the Windows default printer.
+ #[tauri::command]
+ async fn print_document(
+     window: WebviewWindow,
+     paper_width_mm: f64,
+     paper_height_mm: f64,
++    printer_name: Option<String>,
++    copies: Option<u32>,
+ ) -> Result<(), String> {
+     if !paper_width_mm.is_finite()
+         || !paper_height_mm.is_finite()
+@@ -25,6 +40,7 @@
+     {
+         return Err("Invalid print page dimensions.".into());
+     }
++    let copies = copies.unwrap_or(1).clamp(1, 99) as i32;
+ 
+     #[cfg(target_os = "windows")]
+     {
+@@ -37,15 +53,13 @@
+                     let environment = webview.environment().cast::<ICoreWebView2Environment6>();
+                     core.and_then(|core| {
+                         environment.and_then(|environment| {
+-                            let settings = environment.CreatePrintSettings()?;
+-                            settings.SetPageWidth(paper_width_mm / 25.4)?;
+-                            settings.SetPageHeight(paper_height_mm / 25.4)?;
+-                            settings.SetMarginTop(0.0)?;
+-                            settings.SetMarginBottom(0.0)?;
+-                            settings.SetMarginLeft(0.0)?;
+-                            settings.SetMarginRight(0.0)?;
+-                            settings.SetShouldPrintBackgrounds(true)?;
+-                            settings.SetShouldPrintHeaderAndFooter(false)?;
++                            let settings = printing::build_print_settings(
++                                &environment,
++                                paper_width_mm,
++                                paper_height_mm,
++                                printer_name.as_deref(),
++                                copies,
++                            )?;
+ 
+                             let callback_tx = completion_tx.clone();
+                             let handler =
+@@ -95,7 +109,7 @@
+     tauri::Builder::default()
+         .plugin(tauri_plugin_updater::Builder::new().build())
+         .plugin(tauri_plugin_process::init())
+-        .invoke_handler(tauri::generate_handler![print_document])
++        .invoke_handler(tauri::generate_handler![print_document, list_printers])
+         .setup(|app| {
+             if cfg!(debug_assertions) {
+                 app.handle().plugin(
+diff -ruN a/src/printing.rs b/src/printing.rs
+--- a/src/printing.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/printing.rs	2026-10-26 05:53:28.000000000 +0000
+@@ -0,0 +1,122 @@
++//! Windows printing helpers: list the installed printers, and build the WebView2 print settings
++//! (paper size, chosen printer, copies) used for printing without a dialog.
++
++use serde::Serialize;
++
++#[derive(Serialize, Clone, Debug, PartialEq)]
++#[serde(rename_all = "camelCase")]
++pub struct PrinterInfo {
++    pub name: String,
++    pub is_default: bool,
++}
++
++/// Names of the printers installed on this computer (local and network), with the Windows default marked.
++#[cfg(target_os = "windows")]
++pub fn list_installed_printers() -> Result<Vec<PrinterInfo>, String> {
++    use windows::Win32::Graphics::Printing::{
++        EnumPrintersW, GetDefaultPrinterW, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL,
++        PRINTER_INFO_4W,
++    };
++    use windows::core::{PCWSTR, PWSTR};
++
++    let mut names: Vec<String> = Vec::new();
++    let mut default_name = String::new();
++
++    unsafe {
++        let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
++        let (mut needed, mut returned) = (0u32, 0u32);
++        // The first call only reports how much space is needed. It "fails" on purpose.
++        let _ = EnumPrintersW(flags, PCWSTR::null(), 4, None, &mut needed, &mut returned);
++
++        if needed > 0 {
++            // u64 elements keep the buffer 8-byte aligned, which PRINTER_INFO_4W requires.
++            let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
++            let bytes =
++                std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, buffer.len() * 8);
++            EnumPrintersW(
++                flags,
++                PCWSTR::null(),
++                4,
++                Some(bytes),
++                &mut needed,
++                &mut returned,
++            )
++            .map_err(|error| error.to_string())?;
++
++            let infos = std::slice::from_raw_parts(
++                buffer.as_ptr() as *const PRINTER_INFO_4W,
++                returned as usize,
++            );
++            for info in infos {
++                if !info.pPrinterName.is_null() {
++                    names.push(info.pPrinterName.to_string().unwrap_or_default());
++                }
++            }
++        }
++
++        let mut length = 0u32;
++        let _ = GetDefaultPrinterW(None, &mut length);
++        if length > 0 {
++            let mut wide = vec![0u16; length as usize];
++            if GetDefaultPrinterW(Some(PWSTR(wide.as_mut_ptr())), &mut length).as_bool() {
++                let end = (length as usize).saturating_sub(1).min(wide.len());
++                default_name = String::from_utf16_lossy(&wide[..end]);
++            }
++        }
++    }
++
++    names.retain(|name| !name.is_empty());
++    names.sort_by_key(|name| name.to_lowercase());
++    names.dedup();
++    Ok(names
++        .into_iter()
++        .map(|name| PrinterInfo {
++            is_default: name == default_name,
++            name,
++        })
++        .collect())
++}
++
++#[cfg(not(target_os = "windows"))]
++pub fn list_installed_printers() -> Result<Vec<PrinterInfo>, String> {
++    Err("Listing printers is supported only in the Windows desktop app.".into())
++}
++
++/// Print settings for one job. An empty or missing printer name means the Windows default printer.
++#[cfg(target_os = "windows")]
++pub fn build_print_settings(
++    environment: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment6,
++    paper_width_mm: f64,
++    paper_height_mm: f64,
++    printer_name: Option<&str>,
++    copies: i32,
++) -> windows::core::Result<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2PrintSettings>
++{
++    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2PrintSettings2;
++    use windows::core::{Interface, PCWSTR};
++
++    unsafe {
++        let settings = environment.CreatePrintSettings()?;
++        settings.SetPageWidth(paper_width_mm / 25.4)?;
++        settings.SetPageHeight(paper_height_mm / 25.4)?;
++        settings.SetMarginTop(0.0)?;
++        settings.SetMarginBottom(0.0)?;
++        settings.SetMarginLeft(0.0)?;
++        settings.SetMarginRight(0.0)?;
++        settings.SetShouldPrintBackgrounds(true)?;
++        settings.SetShouldPrintHeaderAndFooter(false)?;
++
++        let printer = printer_name.map(str::trim).filter(|name| !name.is_empty());
++        if printer.is_some() || copies > 1 {
++            let settings2 = settings.cast::<ICoreWebView2PrintSettings2>()?;
++            if let Some(name) = printer {
++                let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
++                settings2.SetPrinterName(PCWSTR(wide.as_ptr()))?;
++            }
++            if copies > 1 {
++                settings2.SetCopies(copies)?;
++            }
++        }
++        Ok(settings)
++    }
++}

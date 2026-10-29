@@ -1,13 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Horeca Store POS",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "com.osamamalik.horecastorepos",
   "build": {
-    "frontendDist": "../out",
-    "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "frontendDist": "../horeca-pos-web/out",
+    "devUrl": "http://localhost:3000"
   },
   "app": {
     "windows": [
@@ -27,7 +25,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,6 +35,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "android": { "debugApplicationIdSuffix": ".debug" }
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "PASTE-PUBLIC-KEY-HERE (run scripts\\setup-updater-key.mjs)",
+      "endpoints": [
+        "https://github.com/osamamalikawan/horeca-pos-windows/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

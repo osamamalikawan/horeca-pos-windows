@@ -1,3 +1,6 @@
+mod printing;
+
+use printing::PrinterInfo;
 use tauri::WebviewWindow;
 
 #[cfg(target_os = "windows")]
@@ -12,11 +15,23 @@ use webview2_com::{
 #[cfg(target_os = "windows")]
 use windows::core::Interface;
 
+/// Installed printers, for the printer drop-down in Settings.
+#[tauri::command]
+async fn list_printers() -> Result<Vec<PrinterInfo>, String> {
+    tauri::async_runtime::spawn_blocking(printing::list_installed_printers)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Prints the current page straight to a printer, without a dialog.
+/// An empty or missing `printer_name` means the Windows default printer.
 #[tauri::command]
 async fn print_document(
     window: WebviewWindow,
     paper_width_mm: f64,
     paper_height_mm: f64,
+    printer_name: Option<String>,
+    copies: Option<u32>,
 ) -> Result<(), String> {
     if !paper_width_mm.is_finite()
         || !paper_height_mm.is_finite()
@@ -25,6 +40,7 @@ async fn print_document(
     {
         return Err("Invalid print page dimensions.".into());
     }
+    let copies = copies.unwrap_or(1).clamp(1, 99) as i32;
 
     #[cfg(target_os = "windows")]
     {
@@ -37,15 +53,13 @@ async fn print_document(
                     let environment = webview.environment().cast::<ICoreWebView2Environment6>();
                     core.and_then(|core| {
                         environment.and_then(|environment| {
-                            let settings = environment.CreatePrintSettings()?;
-                            settings.SetPageWidth(paper_width_mm / 25.4)?;
-                            settings.SetPageHeight(paper_height_mm / 25.4)?;
-                            settings.SetMarginTop(0.0)?;
-                            settings.SetMarginBottom(0.0)?;
-                            settings.SetMarginLeft(0.0)?;
-                            settings.SetMarginRight(0.0)?;
-                            settings.SetShouldPrintBackgrounds(true)?;
-                            settings.SetShouldPrintHeaderAndFooter(false)?;
+                            let settings = printing::build_print_settings(
+                                &environment,
+                                paper_width_mm,
+                                paper_height_mm,
+                                printer_name.as_deref(),
+                                copies,
+                            )?;
 
                             let callback_tx = completion_tx.clone();
                             let handler =
@@ -93,7 +107,9 @@ async fn print_document(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![print_document])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![print_document, list_printers])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
