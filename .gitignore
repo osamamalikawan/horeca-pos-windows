@@ -2,3 +2,8 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+/.env.web
+
+.web-src/
+.env.web
+/release/

@@ -4,7 +4,7 @@
   "version": "1.0.1",
   "identifier": "com.osamamalik.horecastorepos",
   "build": {
-    "frontendDist": "../horeca-pos-web/out",
+    "frontendDist": "./.web-src/out",
     "devUrl": "http://localhost:3000"
   },
   "app": {
@@ -39,7 +39,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "PASTE-PUBLIC-KEY-HERE (run scripts\\setup-updater-key.mjs)",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3NEZDNDQ3NDk0ODIwOUEKUldTYUlFaEpSOFJQWjNGempIbWovbWJ0bFNhR3RPWFJIZUpxUXRNMllKa202TjJtb0xIc25rengK (run scripts\\setup-updater-key.mjs)",
       "endpoints": [
         "https://github.com/osamamalikawan/horeca-pos-windows/releases/latest/download/latest.json"
       ],

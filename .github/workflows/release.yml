@@ -5,7 +5,7 @@
 #   1. Push a tag:        git tag v1.0.2 && git push origin v1.0.2
 #   2. GitHub website:    Actions > "Release desktop app" > Run workflow > enter the version
 #
-# The web app inside the installer is built from the horeca-pos-web repository (the same code Vercel hosts).
+# The web app inside the installer is fetched from git (the horeca-pos-web repository, the same code Vercel hosts).
 name: Release desktop app
 
 on:
@@ -36,8 +36,6 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 60
-    env:
-      WEB_REPO: osamamalikawan/horeca-pos-web
     steps:
       - name: Work out the version
         id: v
@@ -54,61 +52,33 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Releasing version $VERSION"
 
-      # The two projects sit side by side, so "../horeca-pos-web/out" in tauri.conf.json works here exactly as on your computer.
       - uses: actions/checkout@v4
-        with:
-          path: horeca-pos-windows
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WEB_REPO }}
-          ref: ${{ inputs.web_ref || 'main' }}
-          token: ${{ secrets.WEB_REPO_TOKEN || github.token }}   # needed only while the web repository is private
-          path: horeca-pos-web
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: horeca-pos-web/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: horeca-pos-windows
-
-      - name: Build the web app
-        working-directory: horeca-pos-web
-        shell: bash
-        env:
-          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
-        run: |
-          npm ci
-          npm run build
-          test -f out/index.html
 
       - name: Set the version
-        working-directory: horeca-pos-windows
         shell: bash
         run: node scripts/set-version.mjs "${{ steps.v.outputs.version }}"
 
-      - name: Build and sign the installer
-        working-directory: horeca-pos-windows
+      # Gets the web app from git (horeca-pos-web), builds it, builds and signs the installer, prepares latest.json.
+      - name: Build the installer
         shell: bash
         env:
+          WEB_REF: ${{ inputs.web_ref || 'main' }}
+          WEB_REPO_TOKEN: ${{ secrets.WEB_REPO_TOKEN }}                 # needed only while the web repository is private
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx --yes @tauri-apps/cli@latest build
-
-      - name: Prepare the update files
-        working-directory: horeca-pos-windows
-        shell: bash
-        env:
           RELEASE_REPO: ${{ github.repository }}
           NOTES: ${{ inputs.notes }}
-        run: node scripts/make-latest-json.mjs "${NOTES:-Version ${{ steps.v.outputs.version }}}"
+        run: node scripts/build-installer.mjs "${NOTES:-Version ${{ steps.v.outputs.version }}}"
 
       - name: Publish the release
-        working-directory: horeca-pos-windows
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
