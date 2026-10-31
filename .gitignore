@@ -7,3 +7,7 @@
 .web-src/
 .env.web
 /release/
+
+.web-src/
+.env.web
+/release/
